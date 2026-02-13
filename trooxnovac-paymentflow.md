@@ -1,73 +1,76 @@
-# Troo × NovacPay — Android POS Payment Flow
+# Troo × NovacPay — Android POS Payment Flow (Card Reader + Encrypted Card Charge)
 
 ## Overview
 
-This document describes the **end-to-end payment flow** for Troo’s Android POS system using **NovacPay**, with **card payments as the default** and **Transfer / USSD / QR** as fallback options.
+Troo’s Android POS supports a **card-first checkout flow** using a **hardware card reader**. Since Novac’s SDK is not used for reader processing, Troo:
 
-All payment outcomes are **verified server-side** before an order is fulfilled.
-
----
-
-## Actors
-
-- Cashier
-- Customer
-- Android POS Device (Troo App)
-- Troo Backend (Order & Payment Services)
-- NovacPay Platform
+1) Creates a Novac checkout reference  
+2) Reads card details from the device card reader (via hardware SDK)  
+3) Encrypts card payload using Novac `/api/v1/encrypt-data`  
+4) Charges card using Novac `/api/v1/card-payment`  
+5) Confirms final status via Novac **webhook + verify**  
+6) Falls back to **Transfer / USSD / QR** if card fails
 
 ---
 
-## High-Level Flow
+## NovacPay APIs Used (per docs)
 
-1. Cashier creates order
-2. Payment Intent is created
-3. Card payment is attempted (default)
-4. If card fails → fallback channels offered
-5. NovacPay sends webhook
-6. Troo verifies transaction
-7. Order is finalized
+- Initialize transaction: `POST https://api.novacpayment.com/api/v1/initiate`
+- Encrypt card payload: `POST https://api.novacpayment.com/api/v1/encrypt-data`
+- Complete card payment: `POST https://api.novacpayment.com/api/v1/card-payment`
+- Webhooks: merchant endpoint receives Novac POST payload
+- Verify transaction: `GET https://api.novacpayment.com/api/v1/checkout/{transactionRef}/verify`
 
 ---
 
-## Sequence Diagram (Card-First with Fallback)
+## Sequence Diagram (Card-first + Fallback)
 
 ```mermaid
 sequenceDiagram
-    participant C as Cashier
-    participant D as Android POS (Troo)
-    participant O as Order Service
-    participant P as Payment Service
-    participant N as NovacPay
+    participant Cashier as Cashier
+    participant Device as Android POS (Troo App)
+    participant Reader as Card Reader SDK (Hardware)
+    participant Order as Order Service
+    participant Pay as Payment Service
+    participant Novac as NovacPay
 
-    C->>D: Create order
-    D->>O: Create/Update Order
-    O-->>D: Order total
+    Cashier->>Device: Build cart / select items
+    Device->>Order: Create/Update Order
+    Order-->>Device: Order total
 
-    C->>D: Checkout
-    D->>P: Create Payment Intent (CARD)
-    P->>N: Initiate Checkout
-    N-->>P: transactionReference
+    Cashier->>Device: Checkout (CARD default)
+    Device->>Pay: Create Payment Intent (channel=CARD)
+    Pay->>Novac: POST /api/v1/initiate (transactionReference, amount, currency, customer)
+    Novac-->>Pay: transactionReference + payment options
 
-    D->>N: Launch Android SDK (Card)
-    N-->>D: SDK Result (Approved / Failed)
+    Device->>Reader: Start card collection (tap/insert/swipe + PIN)
+    Reader-->>Device: Card data (PAN/expiry/CVV/PIN)\n(as provided by reader SDK)
 
-    alt Card Approved
-        N->>P: Webhook (successful)
-        P->>N: Verify Transaction
-        N-->>P: Verified = Success
-        P->>O: Mark Order PAID
-        O-->>D: Order PAID
-        D-->>C: Show Success + Receipt
-    else Card Failed
-        D-->>C: Show Fallback Options
-        C->>D: Select Transfer / USSD / QR
-        D->>P: Request Fallback Instructions
-        P->>N: Initiate Fallback Payment
-        N->>P: Webhook
-        P->>N: Verify Transaction
-        N-->>P: Verified = Success
-        P->>O: Mark Order PAID
-        O-->>D: Order PAID
-        D-->>C: Show Success + Receipt
+    Device->>Pay: Submit card payload (one-time, no storage)
+    Pay->>Novac: POST /api/v1/encrypt-data (card fields + reference)
+    Novac-->>Pay: Encrypted payload
+
+    Pay->>Novac: POST /api/v1/card-payment (encrypted fields + transactionReference)
+    Novac-->>Pay: Immediate response (processing/accepted)
+
+    Novac->>Pay: Webhook event (successful/failed/reversed/abandoned)
+    Pay->>Novac: GET /api/v1/checkout/{ref}/verify
+    Novac-->>Pay: Verified status (pending/successful/failed)
+
+    alt Verified Successful
+        Pay->>Order: Mark Order PAID
+        Order-->>Device: Order PAID
+        Device-->>Cashier: Success + Receipt
+    else Verified Failed
+        Pay-->>Device: Payment failed
+        Device-->>Cashier: Offer fallback: Transfer / USSD / QR
+        Cashier->>Device: Select fallback method
+        Device->>Pay: Start fallback payment
+        Note over Pay,Novac: Complete via Novac channel APIs, then webhook + verify again
+        Novac->>Pay: Webhook
+        Pay->>Novac: Verify /checkout/{ref}/verify
+        Novac-->>Pay: Verified Successful
+        Pay->>Order: Mark Order PAID
+        Order-->>Device: Order PAID
+        Device-->>Cashier: Success + Receipt
     end
